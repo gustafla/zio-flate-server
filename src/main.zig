@@ -5,58 +5,45 @@ const IpAddress = Io.net.IpAddress;
 const log = std.log;
 const builtin = @import("builtin");
 
+const options = @import("options");
 const zio = @import("zio");
 
-var sig_stream: [2]Io.net.Stream = undefined;
+var single_threaded_io: Io.Threaded = .init_single_threaded;
+const concurrent = switch (options.io) {
+    .zio, .std => !builtin.single_threaded,
+    .single_threaded => false,
+};
+
+var sig_io: Io = undefined;
+var sig_event: Io.Event = .unset;
 
 fn sigintHandler(_: std.c.SIG) callconv(.c) void {
-    _ = std.c.write(sig_stream[1].socket.handle, &.{1}, 1);
+    sig_event.set(sig_io);
 }
-
-const ShutdownCtx = struct {
-    accept_loop: *Io.Future(Io.Cancelable!void),
-    is_shutting_down: *std.atomic.Value(bool),
-};
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    // const zio_rt = try zio.Runtime.init(gpa, .{});
-    // defer zio_rt.deinit();
-    // const io = zio_rt.io();
-    const io = init.io;
 
-    const sig_ok = if (builtin.target.os.tag == .linux) blk: {
-        // TODO: Use UNIX sockets (Io.net.Socket.createPair) when stable
-        const loopback_addr = comptime IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
-        var temp_listener = loopback_addr.listen(io, .{}) catch break :blk false;
-        defer temp_listener.deinit(io);
+    const io, const rt = switch (options.io) {
+        .zio => blk: {
+            const rt = try zio.Runtime.init(gpa, .{});
+            break :blk .{ rt.io(), rt };
+        },
+        .std => .{ init.io, {} },
+        .single_threaded => .{ single_threaded_io.io(), {} },
+    };
+    defer if (@TypeOf(rt) != void) rt.deinit();
 
-        const bound_addr = temp_listener.socket.address;
-        sig_stream[1] = bound_addr.connect(io, .{
-            .mode = .stream,
-        }) catch break :blk false;
-        sig_stream[0] = temp_listener.accept(io) catch {
-            sig_stream[1].close(io);
-            break :blk false;
-        };
-
+    const sig_ok = if (concurrent) blk: {
+        sig_io = io;
         var sa: std.c.Sigaction = .{
             .handler = .{ .handler = sigintHandler },
             .mask = undefined,
             .flags = 0,
         };
-        if (std.c.sigemptyset(&sa.mask) != 0) {
-            sig_stream[0].close(io);
-            sig_stream[1].close(io);
-            break :blk false;
-        }
+        if (std.c.sigemptyset(&sa.mask) != 0) break :blk false;
         break :blk std.c.sigaction(std.c.SIG.INT, &sa, null) == 0;
-    };
-
-    defer if (sig_ok) {
-        sig_stream[0].close(io);
-        sig_stream[1].close(io);
-    };
+    } else false;
 
     const listen_addr = comptime IpAddress.parseLiteral("0.0.0.0:3000") catch unreachable;
     var server = try listen_addr.listen(io, .{ .reuse_address = true });
@@ -67,18 +54,13 @@ pub fn main(init: std.process.Init) !void {
     var group: Io.Group = .init;
     defer group.cancel(io);
 
-    var accept_loop = Io.async(io, acceptLoop, .{ io, gpa, &server, &group });
+    var accept_loop = io.async(acceptLoop, .{ io, gpa, &server, &group });
     defer accept_loop.cancel(io) catch {};
 
-    var sigint_watcher = if (sig_ok) blk: {
-        const shutdown_ctx: ShutdownCtx = .{
-            .accept_loop = &accept_loop,
-            .is_shutting_down = &is_shutting_down,
-        };
-        log.info("Spawning SIGINT watcher coroutine", .{});
-        break :blk Io.async(io, watchSigintSocket, .{ io, shutdown_ctx });
-    } else null;
-    defer if (sigint_watcher) |*w| w.cancel(io) catch {};
+    if (sig_ok) {
+        sig_event.waitUncancelable(io);
+        accept_loop.cancel(io) catch {};
+    }
 
     accept_loop.await(io) catch {};
     log.info("Stopped accepting connections...", .{});
@@ -105,24 +87,6 @@ fn acceptLoop(
         };
 
         client_group.async(io, handleClient, .{ io, gpa, stream });
-    }
-}
-
-fn watchSigintSocket(io: Io, ctx: ShutdownCtx) Io.Cancelable!void {
-    var buf: [1]u8 = undefined;
-    // TODO: Use a direct stream.read in 0.17
-    var reader = sig_stream[0].reader(io, &buf);
-    _ = reader.interface.takeByte() catch |err| return switch (err) {
-        error.EndOfStream => {},
-        error.ReadFailed => switch (reader.err.?) {
-            error.Canceled => error.Canceled,
-            else => log.err("SIGINT Watcher died unexpectedly: {t}", .{err}),
-        },
-    };
-
-    if (!ctx.is_shutting_down.swap(true, .monotonic)) {
-        log.info("Caught interrupt. Initiating shutdown...", .{});
-        ctx.accept_loop.cancel(io) catch {};
     }
 }
 

@@ -10,6 +10,14 @@ pub fn build(b: *std.Build) void {
     });
     const zio_mod = zio_dep.module("zio");
 
+    const io_impl = b.option(enum {
+        zio,
+        std,
+        single_threaded,
+    }, "io", "Io implementation") orelse .zio;
+    const options = b.addOptions();
+    options.addOption(@TypeOf(io_impl), "io", io_impl);
+
     const exe = b.addExecutable(.{
         .name = "zio_flate_server",
         .root_module = b.createModule(.{
@@ -17,6 +25,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "options", .module = options.createModule() },
                 .{ .name = "zio", .module = zio_mod },
             },
             .link_libc = true,
