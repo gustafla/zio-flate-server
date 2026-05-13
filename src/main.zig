@@ -47,8 +47,6 @@ pub fn main(init: std.process.Init) !void {
 
     const listen_addr = comptime IpAddress.parseLiteral("0.0.0.0:3000") catch unreachable;
     var server = try listen_addr.listen(io, .{ .reuse_address = true });
-    var is_shutting_down: std.atomic.Value(bool) = .init(false);
-    defer if (!is_shutting_down.load(.monotonic)) server.deinit(io);
     log.info("Listening on {f}", .{listen_addr});
 
     var group: Io.Group = .init;
