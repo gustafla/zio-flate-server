@@ -44,8 +44,7 @@ To verify that the server responds with correct data, you can use `nc` and `gzip
    ```bash
    echo -ne 'README.md\0' | nc localhost 3000 | gzip -d
    ```
-
-You should see the contents of this README file.
+   This should output the contents of this README file.
 
 ### Stress Testing:
 To test the server's concurrency and observe it in action, you can use `nc` to spam the server with requests.
