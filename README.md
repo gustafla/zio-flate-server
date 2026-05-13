@@ -1,0 +1,58 @@
+# Zig Async Flate Server (`zio_flate_server`)
+
+A high-performance, fully asynchronous, compressed file server built on Zig's new `std.Io` interface. 
+
+The server features gzip compression, structured concurrency with `Io.Group`, task cancellation, and a graceful shutdown sequence using `Io.Event`.
+
+## Features
+* **std.Io:** Functions are runtime-agnostic. See [Available Backends](#available-backends).
+* **Streaming Compression:** Uses `std.compress.flate` to compress files on the fly before sending them over the network.
+* **Graceful Shutdown:** Safely handles `SIGINT` (Ctrl+C).
+* **Safe Cancellation:** Protects file-transfer regions to ensure clients never receive half-written data during a shutdown.
+
+## Requirements
+* **Zig 0.16**.
+* The target OS must support `sigaction()`.
+
+## Building and Running
+
+This project supports multiple `Io` backends via the Zig build system. You can select the backend using the `-Dio=` flag.
+
+### Available Backends:
+* `zio` (Default): Uses the [zio](https://github.com/lalinsky/zio) runtime. Highly optimized stackful coroutines.
+* `std`: Uses Zig's built-in `std.Io.Threaded` runtime.
+* `single_threaded`: A purely synchronous, blocking fallback without a concurrent scheduler.
+
+### Run Commands:
+```bash
+# Run with the default zio backend
+zig build run
+
+# Run with Zig's standard threaded Io
+zig build run -Dio=std
+
+# Run in single-threaded blocking mode
+zig build run -Dio=single_threaded
+```
+
+## Client Usage
+
+To verify that the server responds with correct data, you can use `nc` and `gzip`.
+
+1. Start the server in one terminal: `zig build run`.
+2. In a second terminal, you can act as a client:
+   ```bash
+   echo -ne 'README.md\0' | nc localhost 3000 | gzip -d
+   ```
+
+You should see the contents of this README file.
+
+### Stress Testing:
+To test the server's concurrency and observe it in action, you can use `nc` to spam the server with requests.
+
+1. Start the server in one terminal: `zig build run`.
+2. In a second terminal, execute this parallel stress-test loop:
+   ```bash
+   while true; do echo -ne 'build.zig\0' | nc localhost 3000 >/dev/null & done
+   ```
+3. While the stress test is hammering the server, return to the first terminal and press Ctrl+C.
