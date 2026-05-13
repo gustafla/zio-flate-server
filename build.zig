@@ -4,12 +4,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
     const exe = b.addExecutable(.{
         .name = "zio_flate_server",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zio", .module = zio_mod },
+            },
+            .link_libc = true,
         }),
     });
 
