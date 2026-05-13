@@ -1,0 +1,12 @@
+.{
+    .name = .zio_flate_server,
+    .version = "0.0.0",
+    .fingerprint = 0xaf63ba23cf4c40f1, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.248+95507faf1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
