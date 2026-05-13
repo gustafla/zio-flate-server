@@ -9,10 +9,6 @@ const options = @import("options");
 const zio = @import("zio");
 
 var single_threaded_io: Io.Threaded = .init_single_threaded;
-const concurrent = switch (options.io) {
-    .zio, .std => !builtin.single_threaded,
-    .single_threaded => false,
-};
 
 var sig_io: Io = undefined;
 var sig_event: Io.Event = .unset;
@@ -34,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer if (@TypeOf(rt) != void) rt.deinit();
 
-    const sig_ok = if (concurrent) blk: {
+    const sig_ok = blk: {
         sig_io = io;
         var sa: std.c.Sigaction = .{
             .handler = .{ .handler = sigintHandler },
@@ -43,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
         };
         if (std.c.sigemptyset(&sa.mask) != 0) break :blk false;
         break :blk std.c.sigaction(std.c.SIG.INT, &sa, null) == 0;
-    } else false;
+    };
 
     const listen_addr = comptime IpAddress.parseLiteral("0.0.0.0:3000") catch unreachable;
     var server = try listen_addr.listen(io, .{ .reuse_address = true });
@@ -54,20 +50,27 @@ pub fn main(init: std.process.Init) !void {
     var group: Io.Group = .init;
     defer group.cancel(io);
 
-    var accept_loop = io.async(acceptLoop, .{ io, gpa, &server, &group });
-    defer accept_loop.cancel(io) catch {};
+    const MainSelect = union(enum) { accept_loop, signal };
+    var buf: [1]MainSelect = undefined;
+    var select: Io.Select(MainSelect) = .init(io, &buf);
+    log.debug("select.init() returned", .{});
+    defer _ = select.cancel();
+
+    select.async(.accept_loop, acceptLoop, .{ io, gpa, &server, &group });
+    log.debug("select.async() returned", .{});
 
     if (sig_ok) {
-        sig_event.waitUncancelable(io);
-        accept_loop.cancel(io) catch {};
+        log.info("Registering SIGINT handler", .{});
+        select.async(.signal, Io.Event.waitUncancelable, .{ &sig_event, io });
     }
 
-    accept_loop.await(io) catch {};
+    _ = select.await() catch {};
+    log.debug("select.await() returned", .{});
+
+    _ = select.cancel();
     log.info("Stopped accepting connections...", .{});
 
-    log.info("Draining active clients...", .{});
     group.await(io) catch {};
-
     log.info("All connections closed. Goodbye!", .{});
 }
 
@@ -76,10 +79,10 @@ fn acceptLoop(
     gpa: Allocator,
     server: *Io.net.Server,
     client_group: *Io.Group,
-) Io.Cancelable!void {
+) void {
     while (true) {
         const stream = server.accept(io) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
+            error.Canceled => return,
             else => {
                 log.err("Failed to accept connection: {t}", .{err});
                 continue;
