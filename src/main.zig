@@ -1,9 +1,9 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 const log = std.log;
+const builtin = @import("builtin");
 
 const zio = @import("zio");
 
@@ -14,18 +14,19 @@ fn sigintHandler(_: std.c.SIG) callconv(.c) void {
 }
 
 const ShutdownCtx = struct {
-    server: *Io.net.Server,
+    accept_loop: *Io.Future(Io.Cancelable!void),
     is_shutting_down: *std.atomic.Value(bool),
 };
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    const zio_rt = try zio.Runtime.init(gpa, .{});
-    defer zio_rt.deinit();
-    const io = zio_rt.io();
-    // const io = init.io;
+    // const zio_rt = try zio.Runtime.init(gpa, .{});
+    // defer zio_rt.deinit();
+    // const io = zio_rt.io();
+    const io = init.io;
 
-    const sig_ok = blk: {
+    const sig_ok = if (builtin.target.os.tag == .linux) blk: {
+        // TODO: Use UNIX sockets (Io.net.Socket.createPair) when stable
         const loopback_addr = comptime IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
         var temp_listener = loopback_addr.listen(io, .{}) catch break :blk false;
         defer temp_listener.deinit(io);
@@ -63,40 +64,54 @@ pub fn main(init: std.process.Init) !void {
     defer if (!is_shutting_down.load(.monotonic)) server.deinit(io);
     log.info("Listening on {f}", .{listen_addr});
 
-    var admin_group: Io.Group = .init;
-    defer admin_group.cancel(io);
-
-    const shutdown_ctx: ShutdownCtx = .{
-        .server = &server,
-        .is_shutting_down = &is_shutting_down,
-    };
-    if (sig_ok) {
-        log.info("Spawning SIGINT watcher coroutine", .{});
-        admin_group.async(io, watchSigintPipe, .{ io, shutdown_ctx });
-    }
-
     var group: Io.Group = .init;
     defer group.cancel(io);
 
-    while (true) {
-        const stream = server.accept(io) catch |err| {
-            if (is_shutting_down.load(.monotonic)) break;
-            log.err("Failed to accept connection: {t}", .{err});
-            continue;
+    var accept_loop = Io.async(io, acceptLoop, .{ io, gpa, &server, &group });
+    defer accept_loop.cancel(io) catch {};
+
+    var sigint_watcher = if (sig_ok) blk: {
+        const shutdown_ctx: ShutdownCtx = .{
+            .accept_loop = &accept_loop,
+            .is_shutting_down = &is_shutting_down,
         };
+        log.info("Spawning SIGINT watcher coroutine", .{});
+        break :blk Io.async(io, watchSigintSocket, .{ io, shutdown_ctx });
+    } else null;
+    defer if (sigint_watcher) |*w| w.cancel(io) catch {};
 
-        group.async(io, handleClient, .{ io, gpa, stream });
-    }
-
+    accept_loop.await(io) catch {};
     log.info("Stopped accepting connections...", .{});
+
+    log.info("Draining active clients...", .{});
     group.await(io) catch {};
+
     log.info("All connections closed. Goodbye!", .{});
 }
 
-fn watchSigintPipe(io: Io, ctx: ShutdownCtx) Io.Cancelable!void {
-    var buf: [1]u8 = undefined;
-    var reader = sig_stream[0].reader(io, &buf);
+fn acceptLoop(
+    io: Io,
+    gpa: Allocator,
+    server: *Io.net.Server,
+    client_group: *Io.Group,
+) Io.Cancelable!void {
+    while (true) {
+        const stream = server.accept(io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                log.err("Failed to accept connection: {t}", .{err});
+                continue;
+            },
+        };
 
+        client_group.async(io, handleClient, .{ io, gpa, stream });
+    }
+}
+
+fn watchSigintSocket(io: Io, ctx: ShutdownCtx) Io.Cancelable!void {
+    var buf: [1]u8 = undefined;
+    // TODO: Use a direct stream.read in 0.17
+    var reader = sig_stream[0].reader(io, &buf);
     _ = reader.interface.takeByte() catch |err| return switch (err) {
         error.EndOfStream => {},
         error.ReadFailed => switch (reader.err.?) {
@@ -107,7 +122,7 @@ fn watchSigintPipe(io: Io, ctx: ShutdownCtx) Io.Cancelable!void {
 
     if (!ctx.is_shutting_down.swap(true, .monotonic)) {
         log.info("Caught interrupt. Initiating shutdown...", .{});
-        ctx.server.deinit(io);
+        ctx.accept_loop.cancel(io) catch {};
     }
 }
 
