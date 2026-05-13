@@ -2,8 +2,6 @@
 
 A high-performance, fully asynchronous, compressed file server built on Zig's new `std.Io` interface. 
 
-The server features gzip compression, structured concurrency with `Io.Group`, task cancellation, and a graceful shutdown sequence using `Io.Event`.
-
 ## Features
 * **std.Io:** Functions are runtime-agnostic. See [Available Backends](#available-backends).
 * **Streaming Compression:** Uses `std.compress.flate` to compress files on the fly before sending them over the network.
