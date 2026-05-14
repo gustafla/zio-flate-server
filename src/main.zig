@@ -58,6 +58,7 @@ pub fn main(init: std.process.Init) !void {
     if (sig_ok) {
         sig_event.waitUncancelable(io);
         accept_loop.cancel(io) catch {};
+        group.cancel(io);
     }
 
     accept_loop.await(io) catch {};
