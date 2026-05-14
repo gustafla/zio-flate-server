@@ -27,10 +27,10 @@ This project supports multiple `Io` backends via the Zig build system. You can s
 zig build run
 
 # Run with Zig's standard threaded Io
-zig build run -Dio=std
+zig build -Dio=std run
 
 # Run in single-threaded blocking mode
-zig build run -Dio=single_threaded
+zig build -Dio=single_threaded run
 ```
 
 ## Client Usage
