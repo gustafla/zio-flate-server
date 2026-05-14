@@ -93,82 +93,81 @@ fn handleClient(io: Io, gpa: Allocator, stream: Io.net.Stream) Io.Cancelable!voi
     _ = gpa;
     defer stream.close(io);
 
-    const addr = stream.socket.address;
-
     var write_buf: [1024]u8 = undefined;
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    var stream_reader = stream.reader(io, &path_buf);
-    var stream_writer = stream.writer(io, &write_buf);
-    const reader = &stream_reader.interface;
-    const writer = &stream_writer.interface;
-    defer writer.flush() catch log.err(
-        "Can't send to {f}: {t}",
-        .{ addr, stream_writer.err.? },
-    );
+    const addr = stream.socket.address;
+    var path_opt: ?[]const u8 = null;
 
-    const path_opt = reader.takeDelimiter(0) catch |err| return switch (err) {
-        error.ReadFailed => switch (stream_reader.err.?) {
-            error.Canceled => error.Canceled,
-            else => |stream_err| log.err("Client {f} error: {t}", .{ addr, stream_err }),
-        },
-        error.StreamTooLong => {
-            writer.writeAll("ERROR PathTooLong\n\x00") catch {};
-            log.err("Client {f} request path too long", .{addr});
-        },
-    };
+    const err = while (true) {
+        var streamr = stream.reader(io, &path_buf);
+        var streamw = stream.writer(io, &write_buf);
+        defer streamw.interface.flush() catch {};
+        path_opt = null;
 
-    const path = path_opt orelse {
-        log.info("Client {f} disconnected before sending a path", .{addr});
-        return;
-    };
+        path_opt = streamr.interface.takeDelimiter(0) catch |err| switch (err) {
+            error.ReadFailed => break streamr.err.?,
+            error.StreamTooLong => {
+                streamw.interface.writeAll("ERROR PathTooLong\n\x00") catch
+                    break streamw.err.?;
+                log.err("Client {f} request path too long", .{addr});
+                continue;
+            },
+        };
 
-    log.info("Client {f} requested {s}", .{ addr, path });
-
-    var file = Io.Dir.cwd().openFile(io, path, .{
-        .allow_directory = false,
-        .resolve_beneath = false, // TODO: not supported by zio, not working in std
-    }) catch |err| return switch (err) {
-        error.Canceled => error.Canceled,
-        else => |open_err| {
-            writer.print("ERROR {t}\n\x00", .{open_err}) catch {};
-            log.err("Can't open file {s} for {f}: {}", .{ path, addr, open_err });
-        },
-    };
-    defer file.close(io);
-    var file_buf: [1024]u8 = undefined;
-    var file_reader = file.reader(io, &file_buf);
-
-    {
-        const prev_prot = io.swapCancelProtection(.blocked);
-        defer _ = io.swapCancelProtection(prev_prot);
-
-        var comp_buf: [std.compress.flate.max_window_len * 4]u8 = undefined;
-        var comp = std.compress.flate.Compress.init(
-            writer,
-            &comp_buf,
-            .gzip,
-            .default,
-        ) catch {
-            std.debug.assert(stream_writer.err.? != error.Canceled);
+        const path = path_opt orelse {
+            log.info("Client {f} disconnected", .{addr});
             return;
         };
-        defer comp.finish() catch {};
-        const comp_writer = &comp.writer;
 
-        const read = file_reader.interface.streamRemaining(comp_writer) catch |err| switch (err) {
-            error.ReadFailed => {
-                const read_err = file_reader.err.?;
-                std.debug.assert(read_err != error.Canceled);
-                writer.print("ERROR {t}\n\x00", .{read_err}) catch {};
-                log.err("Can't read file {s} for {f}: {}", .{ path, addr, read_err });
-                return;
-            },
-            error.WriteFailed => {
-                std.debug.assert(stream_writer.err.? != error.Canceled);
-                return;
-            },
+        log.info("Client {f} requested {s}", .{ addr, path });
+
+        var file = Io.Dir.cwd().openFile(io, path, .{
+            .allow_directory = false,
+            .resolve_beneath = false, // TODO: not supported by zio, not working in std
+        }) catch |err| {
+            streamw.interface.print("ERROR {t}\n\x00", .{err}) catch
+                break streamw.err.?;
+            break err;
         };
-        log.info("Successfully served {} bytes to {f}", .{ read, addr });
+        defer file.close(io);
+        var file_buf: [1024]u8 = undefined;
+        var filer = file.reader(io, &file_buf);
+
+        {
+            const prev_prot = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(prev_prot);
+
+            var comp_buf: [std.compress.flate.max_window_len]u8 = undefined;
+            var comp = std.compress.flate.Compress.init(
+                &streamw.interface,
+                &comp_buf,
+                .gzip,
+                .default,
+            ) catch break streamw.err.?;
+
+            const read = filer.interface.streamRemaining(&comp.writer) catch |err|
+                switch (err) {
+                    error.ReadFailed => {
+                        streamw.interface.print("ERROR {t}\n\x00", .{filer.err.?}) catch
+                            break streamw.err.?;
+                        break filer.err.?;
+                    },
+                    error.WriteFailed => break streamw.err.?,
+                };
+
+            comp.finish() catch break streamw.err.?;
+            comp.writer.flush() catch break streamw.err.?;
+            streamw.interface.flush() catch break streamw.err.?;
+
+            log.info("Successfully served {} bytes to {f}", .{ read, addr });
+        }
+        io.checkCancel() catch |err| break err;
+    };
+
+    if (err == error.Canceled) return error.Canceled;
+    if (path_opt) |path| {
+        log.err("Error {t} while sending file {s} to {f}", .{ err, path, addr });
+    } else {
+        log.err("Error {t} while serving client {f}", .{ err, addr });
     }
-    io.checkCancel() catch return error.Canceled;
 }
