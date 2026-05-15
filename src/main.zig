@@ -51,20 +51,13 @@ pub fn main(init: std.process.Init) !void {
     var server = try listen_addr.listen(io, .{ .reuse_address = true });
     log.info("Listening on {f}", .{listen_addr});
 
-    var cache: FileCache = .init(gpa);
+    var cache = try FileCache.init(io, gpa);
     defer cache.deinit(io);
-
-    var invalidator = switch (builtin.os.tag) {
-        .linux => io.concurrent(cacheInvalidatorLinux, .{ io, &cache }) catch null,
-        else => null,
-    };
-    if (invalidator == null) log.warn("No file watching supported. Expect stale data.", .{});
-    defer if (invalidator) |*inv| inv.cancel(io) catch {};
 
     var group: Io.Group = .init;
     defer group.cancel(io);
 
-    var accept_loop = io.async(acceptLoop, .{ io, &cache, &server, &group });
+    var accept_loop = io.async(acceptLoop, .{ io, cache, &server, &group });
     defer accept_loop.cancel(io) catch {};
 
     if (sig_ok) {
@@ -165,15 +158,22 @@ const FileCache = struct {
     lock: Io.RwLock,
     gpa: Allocator,
     map: std.StringHashMapUnmanaged([]const u8),
+    invalidator: switch (builtin.os.tag) {
+        .linux => InvalidatorLinux,
+        else => InvalidatorNone,
+    },
 
     pub const Error = Allocator.Error || Io.File.OpenError || Io.File.Reader.Error;
 
-    pub fn init(gpa: Allocator) FileCache {
-        return .{
+    pub fn init(io: Io, gpa: Allocator) Allocator.Error!*FileCache {
+        const cache = try gpa.create(FileCache);
+        cache.* = .{
             .lock = .init,
             .gpa = gpa,
             .map = .empty,
         };
+
+        return cache;
     }
 
     /// Safe to call only after all users have finished or been canceled
@@ -181,12 +181,17 @@ const FileCache = struct {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
 
+        if (self.invalidator) |*future| future.cancel(io) catch {};
+
         var iterator = self.map.iterator();
         while (iterator.next()) |entry| {
-            self.gpa.free(entry.key_ptr.*);
+            const key_sentinel: [:0]const u8 = @ptrCast(entry.key_ptr.*);
+            self.gpa.free(key_sentinel);
             self.gpa.free(entry.value_ptr.*);
         }
         self.map.deinit(self.gpa);
+
+        self.gpa.destroy(self);
     }
 
     pub fn get(self: *FileCache, io: Io, path: []const u8) Error![]const u8 {
@@ -229,13 +234,15 @@ const FileCache = struct {
         };
         comp.finish() catch return error.OutOfMemory;
 
-        const key = try self.gpa.dupe(u8, path);
+        const key = try self.gpa.dupeSentinel(u8, path, 0);
         errdefer self.gpa.free(key);
 
         const data = try allocating.toOwnedSlice();
         errdefer self.gpa.free(data);
 
         try self.map.put(self.gpa, key, data);
+
+        self.invalidator.addWatch(key);
         return data;
     }
 
@@ -249,62 +256,95 @@ const FileCache = struct {
             log.info("Cache invalidated for: {s}", .{path});
         }
     }
-};
 
-fn cacheInvalidatorLinux(io: Io, cache: *FileCache) Io.Cancelable!void {
-    const inotify = linux.inotify_init1(linux.IN.CLOEXEC);
-    switch (linux.errno(inotify)) {
-        .SUCCESS => {},
-        else => {
-            log.err("inotify_init1 failed", .{});
-            return;
-        },
-    }
-    const inotify_fd: linux.fd_t = @intCast(inotify);
+    const InvalidatorLinux = struct {
+        inotify_fd: ?linux.fd_t,
+        map: std.AutoHashMapUnmanaged(c_int, [:0]const u8),
+        task: Io.Future(Io.Cancelable!void),
 
-    var inotify_file = Io.File{
-        .handle = inotify_fd,
-        .flags = .{ .nonblocking = false },
-    };
-    defer inotify_file.close(io);
-
-    const watch = linux.inotify_add_watch(
-        inotify_fd,
-        ".",
-        linux.IN.MODIFY | linux.IN.MOVED_TO | linux.IN.DELETE,
-    );
-    switch (linux.errno(watch)) {
-        .SUCCESS => {},
-        else => {
-            log.err("inotify_add_watch failed", .{});
-            return;
-        },
-    }
-
-    var buf: [@sizeOf(linux.inotify_event) + Io.Dir.max_path_bytes + 1]u8 = undefined;
-
-    while (true) {
-        const bytes_read = inotify_file.readStreaming(io, &.{&buf}) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => {
-                log.err("Inotify read failed: {t}", .{err});
-                return;
-            },
-        };
-
-        var i: usize = 0;
-        while (i < bytes_read) {
-            const event: *linux.inotify_event = @ptrCast(@alignCast(&buf[i]));
-
-            if (event.len > 0) {
-                const name_start = i + @sizeOf(linux.inotify_event);
-                const name_ptr: [*:0]const u8 = @ptrCast(&buf[name_start]);
-                const name = std.mem.span(name_ptr);
-                log.debug("inotify event: {s}", .{name});
-                cache.invalidate(io, name);
+        pub fn init(cache: *FileCache, io: Io) error{
+            InotifyInitFailed,
+            ConcurrencyUnavailable,
+        }!InvalidatorLinux {
+            const inotify = linux.inotify_init1(linux.IN.CLOEXEC);
+            switch (linux.errno(inotify)) {
+                .SUCCESS => {},
+                else => {
+                    log.err("inotify_init1 failed", .{});
+                    return error.InotifyInitFailed;
+                },
             }
 
-            i += @sizeOf(linux.inotify_event) + event.len;
+            return .{
+                .inotify_fd = @intCast(inotify),
+                .map = .empty,
+                .task = try io.concurrent(worker, .{ cache, io }),
+            };
         }
-    }
-}
+
+        pub fn deinit(self: *InvalidatorLinux) void {
+            self.task.cancel() catch {};
+        }
+
+        fn addWatch(self: *FileCache, path: [:0]const u8) void {
+            const inotify_fd = self.invalidator_handle orelse return;
+
+            const watch = linux.inotify_add_watch(
+                inotify_fd,
+                path.ptr,
+                linux.IN.MODIFY | linux.IN.MOVED_TO | linux.IN.DELETE,
+            );
+            switch (linux.errno(watch)) {
+                .SUCCESS => {},
+                else => {
+                    log.err("inotify_add_watch failed", .{});
+                    return;
+                },
+            }
+        }
+
+        fn worker(self: *FileCache, io: Io) Io.Cancelable!void {
+            const file = Io.File{
+                .handle = self.invalidator_handle.?,
+                .flags = .{ .nonblocking = false },
+            };
+            defer file.close(io);
+
+            var buf: [@sizeOf(linux.inotify_event) + Io.Dir.max_path_bytes + 1]u8 = undefined;
+
+            while (true) {
+                const bytes_read = file.readStreaming(io, &.{&buf}) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => {
+                        log.err("Inotify read failed: {t}", .{err});
+                        return;
+                    },
+                };
+
+                var i: usize = 0;
+                while (i < bytes_read) {
+                    const event: *linux.inotify_event = @ptrCast(@alignCast(&buf[i]));
+
+                    if (event.len > 0) {
+                        const name_start = i + @sizeOf(linux.inotify_event);
+                        const name_ptr: [*:0]const u8 = @ptrCast(&buf[name_start]);
+                        const name = std.mem.span(name_ptr);
+                        log.debug("inotify event: {s}", .{name});
+                        self.invalidate(io, name);
+                    }
+
+                    i += @sizeOf(linux.inotify_event) + event.len;
+                }
+            }
+        }
+    };
+
+    const InvalidatorNone = struct {
+        pub fn init(_: *FileCache, _: Io) !@This() {
+            log.warn("No file watching supported. Expect stale data.", .{});
+            return .{};
+        }
+        pub fn deinit(_: *@This(), _: Io) void {}
+        pub fn addWatch(_: *@This(), _: [:0]const u8) void {}
+    };
+};
