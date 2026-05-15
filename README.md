@@ -4,10 +4,10 @@ A high-performance, fully asynchronous, compressed file server built on Zig's ne
 
 ## Features
 * **std.Io:** Functions are runtime-agnostic. See [Available Backends](#available-backends).
-* **Streaming Compression:** Uses `std.compress.flate` to compress files on the fly before sending them over the network.
+* **Compression:** Uses `std.compress.flate` to compress files before sending them over the network.
 * **Graceful Shutdown:** Safely handles `SIGINT` (Ctrl+C).
 * **Safe Cancellation:** Protects file-transfer regions to ensure clients never receive half-written data during a shutdown.
-* **Caching:** Caches gzipped files using a `StringHashMap` and `Io.RwLock`. Currently doesn't feature any cache invalidation, the server must be restarted if file data changes.
+* **Caching:** Caches compressed files using a `StringHashMap` and `Io.RwLock`. Currently doesn't feature any cache invalidation, the server must be restarted if file data changes.
 
 ## Requirements
 * **Zig 0.16**.
