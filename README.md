@@ -41,7 +41,7 @@ To verify that the server responds with correct data, you can use `nc` and `gzip
 1. Start the server in one terminal: `zig build run`.
 2. In a second terminal, you can act as a client:
    ```bash
-   echo -ne 'README.md\0' | nc localhost 3000 | gzip -d
+   echo -ne 'README.md\0\0' | nc localhost 3000 | gzip -d
    ```
    This should output the contents of this README file.
 

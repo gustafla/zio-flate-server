@@ -119,6 +119,8 @@ fn handleClient(
             },
         } orelse return; // Client can disconnect silently
 
+        if (path.len == 0) return; // Graceful session termination
+
         log.info("Client {f} requested {s}", .{ addr, path });
 
         {
