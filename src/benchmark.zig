@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     var reqs_atomic: std.atomic.Value(u64) = .init(0);
     var bytes_atomic: std.atomic.Value(usize) = .init(0);
     var start: std.Io.Event = .unset;
-    var connect_fail: std.Io.Event = .unset;
+    var failed: std.Io.Event = .unset;
 
     var group: Io.Group = .init;
     defer group.cancel(io);
@@ -27,21 +27,18 @@ pub fn main(init: std.process.Init) !void {
             &reqs_atomic,
             &bytes_atomic,
             &start,
-            &connect_fail,
+            &failed,
         });
     }
 
     start.set(io);
-    const Result = union(enum) { ok: Io.Cancelable!void, err: Io.Cancelable!void };
+    const Result = union(enum) { any: Io.Cancelable!void };
     var result_buf: [1]Result = undefined;
     var select: Io.Select(Result) = .init(io, &result_buf);
     defer _ = select.cancel();
-    select.async(.ok, sample, .{ io, &reqs_atomic, &bytes_atomic, 10 });
-    select.async(.err, Io.Event.wait, .{ &connect_fail, io });
-    switch (try select.await()) {
-        .err => log.err("Failed to connect", .{}),
-        .ok => {},
-    }
+    select.async(.any, sample, .{ io, &reqs_atomic, &bytes_atomic, 10 });
+    select.async(.any, Io.Event.wait, .{ &failed, io });
+    _ = try select.await();
 }
 
 fn sample(
@@ -76,12 +73,15 @@ fn request(
     reqs_atomic: *std.atomic.Value(u64),
     bytes_atomic: *std.atomic.Value(usize),
     start: *Io.Event,
-    connect_fail: *Io.Event,
+    failed: *Io.Event,
 ) Io.Cancelable!void {
     const stream = server_addr.connect(io, .{ .mode = .stream }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => {
-            connect_fail.set(io);
+            if (!failed.isSet()) {
+                log.err("Failed to connect", .{});
+            }
+            failed.set(io);
             return;
         },
     };
@@ -124,6 +124,11 @@ fn request(
     switch (err) {
         error.Canceled => return error.Canceled,
         error.ReadFailed => {},
-        else => log.err("Fatal error {t}", .{err}),
+        else => {
+            if (!failed.isSet()) {
+                log.err("Fatal error {t}", .{err});
+            }
+            failed.set(io);
+        },
     }
 }
