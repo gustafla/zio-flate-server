@@ -19,7 +19,7 @@ const concurrent = switch (options.io) {
 var sig_io: Io = undefined;
 var sig_event: Io.Event = .unset;
 
-fn sigintHandler(_: std.c.SIG) callconv(.c) void {
+fn sigintHandler(_: std.posix.SIG) callconv(.c) void {
     sig_event.set(sig_io);
 }
 
@@ -36,16 +36,15 @@ pub fn main(init: std.process.Init) !void {
     };
     defer if (@TypeOf(rt) != void) rt.deinit();
 
-    const sig_ok = if (concurrent) blk: {
+    if (concurrent) {
         sig_io = io;
-        var sa: std.c.Sigaction = .{
+        var sa: std.posix.Sigaction = .{
             .handler = .{ .handler = sigintHandler },
-            .mask = undefined,
+            .mask = std.posix.sigemptyset(),
             .flags = 0,
         };
-        if (std.c.sigemptyset(&sa.mask) != 0) break :blk false;
-        break :blk std.c.sigaction(std.c.SIG.INT, &sa, null) == 0;
-    } else false;
+        std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+    }
 
     const listen_addr = comptime IpAddress.parseLiteral("0.0.0.0:3000") catch unreachable;
     var server = try listen_addr.listen(io, .{ .reuse_address = true });
@@ -60,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
     var accept_loop = io.async(acceptLoop, .{ io, cache, &server, &group });
     defer accept_loop.cancel(io) catch {};
 
-    if (sig_ok) {
+    if (concurrent) {
         sig_event.waitUncancelable(io);
         accept_loop.cancel(io) catch {};
         group.cancel(io);
