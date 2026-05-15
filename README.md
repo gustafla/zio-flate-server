@@ -7,6 +7,7 @@ A high-performance, fully asynchronous, compressed file server built on Zig's ne
 * **Streaming Compression:** Uses `std.compress.flate` to compress files on the fly before sending them over the network.
 * **Graceful Shutdown:** Safely handles `SIGINT` (Ctrl+C).
 * **Safe Cancellation:** Protects file-transfer regions to ensure clients never receive half-written data during a shutdown.
+* **Caching:** Caches gzipped files using a `StringHashMap` and `Io.RwLock`. Currently doesn't feature any cache invalidation, the server must be restarted if file data changes.
 
 ## Requirements
 * **Zig 0.16**.
@@ -45,11 +46,11 @@ To verify that the server responds with correct data, you can use `nc` and `gzip
    This should output the contents of this README file.
 
 ### Stress Testing:
-To test the server's concurrency and observe it in action, you can use `nc` to spam the server with requests.
+To test the server's concurrency and observe it in action, you can use the included benchmark program to spam the server with requests.
 
-1. Start the server in one terminal: `zig build run`.
-2. In a second terminal, execute this parallel stress-test loop:
-   ```bash
-   while true; do echo -ne 'build.zig\0' | nc localhost 3000 >/dev/null & done
+1. Start the server in one terminal: `zig build -Doptimize=ReleaseFast run`.
+2. In a second terminal, execute the benchmark:
    ```
-3. While the stress test is hammering the server, return to the first terminal and press Ctrl+C.
+   zig build -Doptimize=ReleaseFast benchmark
+   ```
+3. To test cancelation and error handling while the stress test is hammering the server, return to the first terminal and press Ctrl+C.
