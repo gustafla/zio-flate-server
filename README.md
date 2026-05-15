@@ -31,7 +31,7 @@ zig build run
 # Run with Zig's standard threaded Io
 zig build -Dio=std run
 
-# Run in single-threaded blocking mode
+# Run in single-threaded blocking mode (limited to one client at a time)
 zig build -Dio=single_threaded run
 ```
 
