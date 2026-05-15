@@ -8,7 +8,7 @@ const builtin = @import("builtin");
 
 lock: Io.RwLock,
 gpa: Allocator,
-map: std.StringHashMapUnmanaged([]const u8),
+data_map: std.StringHashMapUnmanaged([]const u8),
 invalidator: Invalidator,
 
 const Cache = @This();
@@ -24,11 +24,12 @@ pub const Error = Allocator.Error ||
     Invalidator.Error;
 
 pub fn init(io: Io, gpa: Allocator) Error!*Cache {
+    log.debug("Cache.init", .{});
     const cache = try gpa.create(Cache);
     cache.* = .{
         .lock = .init,
         .gpa = gpa,
-        .map = .empty,
+        .data_map = .empty,
         .invalidator = try Invalidator.init(),
     };
     cache.invalidator.start(io) catch {
@@ -41,35 +42,43 @@ pub fn init(io: Io, gpa: Allocator) Error!*Cache {
 
 /// Safe to call only after all users have finished or been canceled
 pub fn deinit(self: *Cache, io: Io) void {
-    self.lock.lockUncancelable(io);
-    defer self.lock.unlock(io);
+    log.debug("Cache.deinit", .{});
+    self.takeLockUncancelable(io);
+    defer self.unlock(io);
 
     self.invalidator.deinit(io);
 
-    var iterator = self.map.iterator();
+    var iterator = self.data_map.iterator();
     while (iterator.next()) |entry| {
         const key_sentinel: [:0]const u8 = @ptrCast(entry.key_ptr.*);
         self.gpa.free(key_sentinel);
         self.gpa.free(entry.value_ptr.*);
     }
-    self.map.deinit(self.gpa);
+    self.data_map.deinit(self.gpa);
 
     self.gpa.destroy(self);
 }
 
 pub fn get(self: *Cache, io: Io, path: []const u8) Error![]const u8 {
+    log.debug("Cache.get", .{});
     {
-        try self.lock.lockShared(io);
-        defer self.lock.unlockShared(io);
-        if (self.map.get(path)) |data| {
+        try self.takeLockShared(io);
+        defer self.unlockShared(io);
+        if (self.data_map.get(path)) |data| {
+            log.debug("Cache.get fast path return", .{});
             return data;
         }
     }
 
-    try self.lock.lock(io);
-    defer self.lock.unlock(io);
+    try self.takeLock(io);
+    defer self.unlock(io);
 
-    var file = try Io.Dir.cwd().openFile(io, path, .{
+    if (self.data_map.get(path)) |data| {
+        log.debug("Cache.get double-check return", .{});
+        return data;
+    }
+
+    const file = try Io.Dir.cwd().openFile(io, path, .{
         .allow_directory = false,
         .resolve_beneath = false, // TODO: not supported by zio, not working in std
     });
@@ -103,33 +112,23 @@ pub fn get(self: *Cache, io: Io, path: []const u8) Error![]const u8 {
     const data = try allocating.toOwnedSlice();
     errdefer self.gpa.free(data);
 
-    try self.map.put(self.gpa, key, data);
-
+    try self.data_map.put(self.gpa, key, data);
     self.invalidator.addWatch(key);
+
+    log.debug("Cache.get slow path return", .{});
     return data;
-}
-
-pub fn invalidate(self: *Cache, io: Io, path: []const u8) void {
-    self.lock.lockUncancelable(io);
-    defer self.lock.unlock(io);
-
-    if (self.map.fetchRemove(path)) |entry| {
-        const key_sentinel: [:0]const u8 = @ptrCast(entry.key);
-        log.info("Cache invalidated for: {s}", .{path});
-        self.gpa.free(key_sentinel);
-        self.gpa.free(entry.value);
-    }
 }
 
 const InvalidatorLinux = struct {
     inotify_fd: linux.fd_t,
-    map: std.AutoHashMapUnmanaged(c_int, [:0]const u8),
+    path_map: std.AutoHashMapUnmanaged(c_int, [:0]const u8),
     task: ?Io.Future(Io.Cancelable!void),
 
     pub const Error = error{InotifyInitFailed};
 
     pub fn init() @This().Error!InvalidatorLinux {
-        const inotify = linux.inotify_init1(linux.IN.CLOEXEC);
+        log.debug("InvalidatorLinux.init", .{});
+        const inotify = linux.inotify_init1(linux.IN.CLOEXEC | linux.IN.NONBLOCK);
         switch (linux.errno(inotify)) {
             .SUCCESS => {},
             else => return error.InotifyInitFailed,
@@ -139,24 +138,27 @@ const InvalidatorLinux = struct {
 
         return .{
             .inotify_fd = fd,
-            .map = .empty,
+            .path_map = .empty,
             .task = null,
         };
     }
 
     pub fn start(self: *InvalidatorLinux, io: Io) Io.ConcurrentError!void {
-        const cache: *Cache = @fieldParentPtr("invalidator", self);
-        self.task = try io.concurrent(worker, .{ io, cache });
+        log.debug("InvalidatorLinux.start", .{});
+        self.task = try io.concurrent(worker, .{ io, self });
     }
 
     pub fn deinit(self: *InvalidatorLinux, io: Io) void {
+        log.debug("InvalidatorLinux.deinit", .{});
         const cache: *Cache = @fieldParentPtr("invalidator", self);
-        if (self.task) |*fut| fut.cancel(io) catch {};
-        self.map.deinit(cache.gpa);
+        if (self.task) |*task| task.cancel(io) catch {};
+        self.path_map.deinit(cache.gpa);
         _ = linux.close(self.inotify_fd);
     }
 
+    /// This may only be called when parent cache lock is held
     fn addWatch(self: *InvalidatorLinux, path: [:0]const u8) void {
+        log.debug("InvalidatorLinux.addWatch", .{});
         const cache: *Cache = @fieldParentPtr("invalidator", self);
 
         const watch = linux.inotify_add_watch(
@@ -173,53 +175,90 @@ const InvalidatorLinux = struct {
         }
         const wd: c_int = @intCast(watch);
 
-        self.map.put(cache.gpa, wd, path) catch {
+        self.path_map.put(cache.gpa, wd, path) catch {
             log.err("inotify map allocation failed", .{});
             _ = linux.inotify_rm_watch(self.inotify_fd, wd);
         };
     }
 
-    fn worker(io: Io, cache: *Cache) Io.Cancelable!void {
-        const self = &cache.invalidator;
+    fn worker(io: Io, self: *InvalidatorLinux) Io.Cancelable!void {
+        log.debug("InvalidatorLinux.worker", .{});
+        const cache: *Cache = @fieldParentPtr("invalidator", self);
         const file = Io.File{
             .handle = self.inotify_fd,
-            .flags = .{ .nonblocking = false },
+            .flags = .{ .nonblocking = true },
         };
         defer file.close(io);
 
-        var buf: [@sizeOf(linux.inotify_event) * 4]u8 = undefined;
+        const buf_size = @sizeOf(linux.inotify_event) + Io.Dir.max_path_bytes;
+        var buffer: [buf_size]u8 = undefined;
+        var fr = file.reader(io, &buffer);
+        const fri = &fr.interface;
 
-        while (true) {
-            const bytes_read = file.readStreaming(io, &.{&buf}) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => {
-                    log.err("Inotify read failed: {t}", .{err});
-                    return;
-                },
-            };
+        const err = while (true) {
+            log.debug("InvalidatorLinux.worker calling takeStruct", .{});
+            const event = fri.takeStruct(
+                linux.inotify_event,
+                .native,
+            ) catch |e| break fr.err orelse e;
+            log.debug("InvalidatorLinux.worker calling discardShort", .{});
+            _ = fri.discardShort(event.len) catch break fr.err.?;
+            log.debug("{any}", .{event});
 
-            var i: usize = 0;
-            while (i < bytes_read) {
-                const event: *linux.inotify_event = @ptrCast(@alignCast(&buf[i]));
+            if (event.wd < 0) continue;
 
-                if (event.wd >= 0) {
-                    const path = self.map.get(event.wd) orelse {
-                        log.err("inotify returned unknown wd", .{});
-                        continue;
-                    };
-                    cache.invalidate(io, path);
-                }
+            // This prevents addWatch from being called and protects
+            // path_map from concurrent access
+            try cache.takeLock(io);
+            defer cache.unlock(io);
 
-                i += @sizeOf(linux.inotify_event) + event.len;
-            }
-        }
+            const path = self.path_map.fetchRemove(event.wd) orelse continue;
+            const data = cache.data_map.fetchRemove(path.value) orelse continue;
+            const key: [:0]const u8 = @ptrCast(data.key);
+
+            log.info("Cache invalidated for {s}", .{key});
+            cache.gpa.free(key);
+            cache.gpa.free(data.value);
+            _ = linux.inotify_rm_watch(self.inotify_fd, event.wd);
+        };
+
+        if (err == error.Canceled) return error.Canceled;
+        log.err("Inotify read failed: {t}", .{err});
     }
 };
+
+fn takeLockUncancelable(self: *Cache, io: Io) void {
+    log.debug("Cache.takeLockUncancelable", .{});
+    self.lock.lockUncancelable(io);
+}
+
+fn takeLock(self: *Cache, io: Io) Io.Cancelable!void {
+    log.debug("Cache.takeLock", .{});
+    try self.lock.lock(io);
+}
+
+fn unlock(self: *Cache, io: Io) void {
+    log.debug("Cache.unlock", .{});
+    self.lock.unlock(io);
+}
+
+fn takeLockShared(self: *Cache, io: Io) Io.Cancelable!void {
+    log.debug("Cache.takeLockShared", .{});
+    try self.lock.lockShared(io);
+}
+
+fn unlockShared(self: *Cache, io: Io) void {
+    log.debug("Cache.unlockShared", .{});
+    self.lock.unlockShared(io);
+}
 
 const InvalidatorNone = struct {
     pub const Error = error{};
     pub fn init() @This().Error!@This() {
-        log.warn("No file watching supported. Expect stale data.", .{});
+        log.warn(
+            "File notifications not implemented on {t}. Expect stale data.",
+            .{builtin.os.tag},
+        );
         return .{};
     }
     pub fn start(_: *@This(), _: Io) Io.ConcurrentError!void {}
