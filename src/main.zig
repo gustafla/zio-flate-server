@@ -50,10 +50,13 @@ pub fn main(init: std.process.Init) !void {
     var server = try listen_addr.listen(io, .{ .reuse_address = true });
     log.info("Listening on {f}", .{listen_addr});
 
+    var cache: FileCache = .init(gpa);
+    defer cache.deinit(io);
+
     var group: Io.Group = .init;
     defer group.cancel(io);
 
-    var accept_loop = io.async(acceptLoop, .{ io, gpa, &server, &group });
+    var accept_loop = io.async(acceptLoop, .{ io, &cache, &server, &group });
     defer accept_loop.cancel(io) catch {};
 
     if (sig_ok) {
@@ -73,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn acceptLoop(
     io: Io,
-    gpa: Allocator,
+    cache: *FileCache,
     server: *Io.net.Server,
     client_group: *Io.Group,
 ) Io.Cancelable!void {
@@ -86,12 +89,15 @@ fn acceptLoop(
             },
         };
 
-        client_group.async(io, handleClient, .{ io, gpa, stream });
+        client_group.async(io, handleClient, .{ io, cache, stream });
     }
 }
 
-fn handleClient(io: Io, gpa: Allocator, stream: Io.net.Stream) Io.Cancelable!void {
-    _ = gpa;
+fn handleClient(
+    io: Io,
+    cache: *FileCache,
+    stream: Io.net.Stream,
+) Io.Cancelable!void {
     defer stream.close(io);
     const addr = stream.socket.address;
 
@@ -115,38 +121,20 @@ fn handleClient(io: Io, gpa: Allocator, stream: Io.net.Stream) Io.Cancelable!voi
 
         log.info("Client {f} requested {s}", .{ addr, path });
 
-        var file = Io.Dir.cwd().openFile(io, path, .{
-            .allow_directory = false,
-            .resolve_beneath = false, // TODO: not supported by zio, not working in std
-        }) catch |err| {
-            swi.print("ERROR {t}\n\x00", .{err}) catch break sw.err.?;
-            continue;
-        };
-        defer file.close(io);
-
-        var file_buf: [1024]u8 = undefined;
-        var fr = file.reader(io, &file_buf);
-        const fri = &fr.interface;
-
         {
             const prev_prot = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(prev_prot);
 
-            var buf: [flate.max_window_len]u8 = undefined;
-            var comp = flate.Compress.init(swi, &buf, .gzip, .default) catch break sw.err.?;
-
-            const read = fri.streamRemaining(&comp.writer) catch |err| switch (err) {
-                error.ReadFailed => {
-                    swi.print("ERROR {t}\n\x00", .{fr.err.?}) catch break sw.err.?;
-                    continue;
-                },
-                error.WriteFailed => break sw.err.?,
+            const data = cache.get(io, path) catch |err| {
+                if (err == error.Canceled) break err;
+                swi.print("ERROR {t}\n\x00", .{err}) catch break sw.err.?;
+                continue;
             };
 
-            comp.finish() catch break sw.err.?;
+            swi.writeAll(data) catch break sw.err.?;
             swi.flush() catch break sw.err.?;
 
-            log.info("Successfully served {} bytes to {f}", .{ read, addr });
+            log.info("Successfully served {} bytes to {f}", .{ data.len, addr });
         }
         io.checkCancel() catch |err| break err;
     };
@@ -162,3 +150,82 @@ fn handleClient(io: Io, gpa: Allocator, stream: Io.net.Stream) Io.Cancelable!voi
         else => log.err("Client {f} fatal error {t}", .{ addr, err }),
     }
 }
+
+const FileCache = struct {
+    lock: Io.RwLock,
+    gpa: Allocator,
+    map: std.StringHashMapUnmanaged([]const u8),
+
+    pub const Error = Allocator.Error || Io.File.OpenError || Io.File.Reader.Error;
+
+    pub fn init(gpa: Allocator) FileCache {
+        return .{
+            .lock = .init,
+            .gpa = gpa,
+            .map = .empty,
+        };
+    }
+
+    /// Safe to call only after all users have finished or been canceled
+    pub fn deinit(self: *FileCache, io: Io) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+
+        var iterator = self.map.iterator();
+        while (iterator.next()) |item| {
+            self.gpa.free(item.key_ptr.*);
+            self.gpa.free(item.value_ptr.*);
+        }
+        self.map.deinit(self.gpa);
+    }
+
+    pub fn get(self: *FileCache, io: Io, path: []const u8) Error![]const u8 {
+        {
+            try self.lock.lockShared(io);
+            defer self.lock.unlockShared(io);
+            if (self.map.get(path)) |data| {
+                return data;
+            }
+        }
+
+        try self.lock.lock(io);
+        defer self.lock.unlock(io);
+
+        var file = try Io.Dir.cwd().openFile(io, path, .{
+            .allow_directory = false,
+            .resolve_beneath = false, // TODO: not supported by zio, not working in std
+        });
+        defer file.close(io);
+
+        var file_buf: [1024]u8 = undefined;
+        var file_reader = file.reader(io, &file_buf);
+        const fri = &file_reader.interface;
+
+        var allocating: Io.Writer.Allocating = .init(self.gpa);
+        defer allocating.deinit();
+        try allocating.ensureUnusedCapacity(64);
+
+        var comp_buf: [flate.max_window_len]u8 = undefined;
+        var comp = flate.Compress.init(
+            &allocating.writer,
+            &comp_buf,
+            .gzip,
+            .default,
+        ) catch return error.OutOfMemory;
+
+        _ = fri.streamRemaining(&comp.writer) catch |e| switch (e) {
+            error.ReadFailed => return file_reader.err.?,
+            error.WriteFailed => return error.OutOfMemory,
+        };
+        comp.finish() catch return error.OutOfMemory;
+
+        const key = try self.gpa.dupe(u8, path);
+        errdefer self.gpa.free(key);
+
+        const data = try allocating.toOwnedSlice();
+        errdefer self.gpa.free(data);
+
+        try self.map.put(self.gpa, key, data);
+        return data;
+    }
+};
