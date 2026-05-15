@@ -158,19 +158,29 @@ const FileCache = struct {
     lock: Io.RwLock,
     gpa: Allocator,
     map: std.StringHashMapUnmanaged([]const u8),
-    invalidator: switch (builtin.os.tag) {
+    invalidator: Invalidator,
+
+    const Invalidator = switch (builtin.os.tag) {
         .linux => InvalidatorLinux,
         else => InvalidatorNone,
-    },
+    };
 
-    pub const Error = Allocator.Error || Io.File.OpenError || Io.File.Reader.Error;
+    pub const Error = Allocator.Error ||
+        Io.File.OpenError ||
+        Io.File.Reader.Error ||
+        Invalidator.Error;
 
-    pub fn init(io: Io, gpa: Allocator) Allocator.Error!*FileCache {
+    pub fn init(io: Io, gpa: Allocator) Error!*FileCache {
         const cache = try gpa.create(FileCache);
         cache.* = .{
             .lock = .init,
             .gpa = gpa,
             .map = .empty,
+            .invalidator = try Invalidator.init(),
+        };
+        cache.invalidator.start(io) catch {
+            log.warn("No file watching supported. Expect stale data.", .{});
+            cache.invalidator.deinit(io);
         };
 
         return cache;
@@ -181,7 +191,7 @@ const FileCache = struct {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
 
-        if (self.invalidator) |*future| future.cancel(io) catch {};
+        self.invalidator.deinit(io);
 
         var iterator = self.map.iterator();
         while (iterator.next()) |entry| {
@@ -251,46 +261,53 @@ const FileCache = struct {
         defer self.lock.unlock(io);
 
         if (self.map.fetchRemove(path)) |entry| {
-            self.gpa.free(entry.key);
-            self.gpa.free(entry.value);
+            const key_sentinel: [:0]const u8 = @ptrCast(entry.key);
             log.info("Cache invalidated for: {s}", .{path});
+            self.gpa.free(key_sentinel);
+            self.gpa.free(entry.value);
         }
     }
 
     const InvalidatorLinux = struct {
-        inotify_fd: ?linux.fd_t,
+        inotify_fd: linux.fd_t,
         map: std.AutoHashMapUnmanaged(c_int, [:0]const u8),
-        task: Io.Future(Io.Cancelable!void),
+        task: ?Io.Future(Io.Cancelable!void),
 
-        pub fn init(cache: *FileCache, io: Io) error{
-            InotifyInitFailed,
-            ConcurrencyUnavailable,
-        }!InvalidatorLinux {
+        pub const Error = error{InotifyInitFailed};
+
+        pub fn init() @This().Error!InvalidatorLinux {
             const inotify = linux.inotify_init1(linux.IN.CLOEXEC);
             switch (linux.errno(inotify)) {
                 .SUCCESS => {},
-                else => {
-                    log.err("inotify_init1 failed", .{});
-                    return error.InotifyInitFailed;
-                },
+                else => return error.InotifyInitFailed,
             }
+            const fd: linux.fd_t = @intCast(inotify);
+            errdefer _ = linux.close(fd);
 
             return .{
-                .inotify_fd = @intCast(inotify),
+                .inotify_fd = fd,
                 .map = .empty,
-                .task = try io.concurrent(worker, .{ cache, io }),
+                .task = null,
             };
         }
 
-        pub fn deinit(self: *InvalidatorLinux) void {
-            self.task.cancel() catch {};
+        pub fn start(self: *InvalidatorLinux, io: Io) Io.ConcurrentError!void {
+            const cache: *FileCache = @fieldParentPtr("invalidator", self);
+            self.task = try io.concurrent(worker, .{ io, cache });
         }
 
-        fn addWatch(self: *FileCache, path: [:0]const u8) void {
-            const inotify_fd = self.invalidator_handle orelse return;
+        pub fn deinit(self: *InvalidatorLinux, io: Io) void {
+            const cache: *FileCache = @fieldParentPtr("invalidator", self);
+            if (self.task) |*fut| fut.cancel(io) catch {};
+            self.map.deinit(cache.gpa);
+            _ = linux.close(self.inotify_fd);
+        }
+
+        fn addWatch(self: *InvalidatorLinux, path: [:0]const u8) void {
+            const cache: *FileCache = @fieldParentPtr("invalidator", self);
 
             const watch = linux.inotify_add_watch(
-                inotify_fd,
+                self.inotify_fd,
                 path.ptr,
                 linux.IN.MODIFY | linux.IN.MOVED_TO | linux.IN.DELETE,
             );
@@ -301,16 +318,23 @@ const FileCache = struct {
                     return;
                 },
             }
+            const wd: c_int = @intCast(watch);
+
+            self.map.put(cache.gpa, wd, path) catch {
+                log.err("inotify map allocation failed", .{});
+                _ = linux.inotify_rm_watch(self.inotify_fd, wd);
+            };
         }
 
-        fn worker(self: *FileCache, io: Io) Io.Cancelable!void {
+        fn worker(io: Io, cache: *FileCache) Io.Cancelable!void {
+            const self = &cache.invalidator;
             const file = Io.File{
-                .handle = self.invalidator_handle.?,
+                .handle = self.inotify_fd,
                 .flags = .{ .nonblocking = false },
             };
             defer file.close(io);
 
-            var buf: [@sizeOf(linux.inotify_event) + Io.Dir.max_path_bytes + 1]u8 = undefined;
+            var buf: [@sizeOf(linux.inotify_event) * 4]u8 = undefined;
 
             while (true) {
                 const bytes_read = file.readStreaming(io, &.{&buf}) catch |err| switch (err) {
@@ -325,12 +349,12 @@ const FileCache = struct {
                 while (i < bytes_read) {
                     const event: *linux.inotify_event = @ptrCast(@alignCast(&buf[i]));
 
-                    if (event.len > 0) {
-                        const name_start = i + @sizeOf(linux.inotify_event);
-                        const name_ptr: [*:0]const u8 = @ptrCast(&buf[name_start]);
-                        const name = std.mem.span(name_ptr);
-                        log.debug("inotify event: {s}", .{name});
-                        self.invalidate(io, name);
+                    if (event.wd >= 0) {
+                        const path = self.map.get(event.wd) orelse {
+                            log.err("inotify returned unknown wd", .{});
+                            continue;
+                        };
+                        cache.invalidate(io, path);
                     }
 
                     i += @sizeOf(linux.inotify_event) + event.len;
@@ -340,10 +364,12 @@ const FileCache = struct {
     };
 
     const InvalidatorNone = struct {
-        pub fn init(_: *FileCache, _: Io) !@This() {
+        pub const Error = error{};
+        pub fn init() @This().Error!@This() {
             log.warn("No file watching supported. Expect stale data.", .{});
             return .{};
         }
+        pub fn start(_: *@This(), _: Io) Io.ConcurrentError!void {}
         pub fn deinit(_: *@This(), _: Io) void {}
         pub fn addWatch(_: *@This(), _: [:0]const u8) void {}
     };
