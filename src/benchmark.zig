@@ -2,88 +2,128 @@ const std = @import("std");
 const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 const log = std.log;
+const flate = std.compress.flate;
 
 const zio = @import("zio");
+
+const server_addr = IpAddress.parseLiteral("127.0.0.1:3000") catch unreachable;
 
 pub fn main(init: std.process.Init) !void {
     const rt = try zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
     const io = rt.io();
 
-    var rps: std.atomic.Value(u64) = .init(0);
-    var bytes: std.atomic.Value(u64) = .init(0);
-    var connect_fail: Io.Event = .unset;
+    var reqs_atomic: std.atomic.Value(u64) = .init(0);
+    var bytes_atomic: std.atomic.Value(usize) = .init(0);
+    var start: std.Io.Event = .unset;
+    var connect_fail: std.Io.Event = .unset;
 
     var group: Io.Group = .init;
     defer group.cancel(io);
 
     for (0..1000) |_| {
-        group.async(io, request, .{ io, &rps, &bytes, &connect_fail });
+        group.async(io, request, .{
+            io,
+            &reqs_atomic,
+            &bytes_atomic,
+            &start,
+            &connect_fail,
+        });
     }
 
-    for (0..10) |i| {
-        if (connect_fail.isSet()) {
-            log.err("Failed to connect", .{});
-            return;
-        }
-        try io.sleep(.fromSeconds(1), .awake);
-        const rps_sample = rps.swap(0, .acquire);
-        const bytes_sample = bytes.swap(0, .acquire);
-        std.log.info("{}: RPS: {}, decompressed throughput: {:.2} MiB/s", .{
-            i, rps_sample, @as(f128, @floatFromInt(bytes_sample)) / (1024.0 * 1024.0),
+    start.set(io);
+    const Result = union(enum) { ok: Io.Cancelable!void, err: Io.Cancelable!void };
+    var result_buf: [1]Result = undefined;
+    var select: Io.Select(Result) = .init(io, &result_buf);
+    defer _ = select.cancel();
+    select.async(.ok, sample, .{ io, &reqs_atomic, &bytes_atomic, 10 });
+    select.async(.err, Io.Event.wait, .{ &connect_fail, io });
+    switch (try select.await()) {
+        .err => log.err("Failed to connect", .{}),
+        .ok => {},
+    }
+}
+
+fn sample(
+    io: Io,
+    reqs_atomic: *std.atomic.Value(u64),
+    bytes_atomic: *std.atomic.Value(usize),
+    samples: usize,
+) Io.Cancelable!void {
+    const clock: std.Io.Clock = .awake;
+
+    for (0..samples) |i| {
+        const ts = clock.now(io);
+        try io.sleep(.fromSeconds(1), clock);
+        const dur = ts.durationTo(clock.now(io));
+
+        const reqs_sample = reqs_atomic.swap(0, .monotonic);
+        const bytes_sample = bytes_atomic.swap(0, .monotonic);
+
+        const requests: f128 = @floatFromInt(reqs_sample);
+        const bytes: f128 = @floatFromInt(bytes_sample);
+        const nanoseconds: f128 = @floatFromInt(dur.nanoseconds);
+        const seconds = nanoseconds / std.time.ns_per_s;
+
+        std.log.info("{}: RPS: {:.2}, decompressed throughput: {:.2} MiB/s", .{
+            i, requests / seconds, (bytes / (1024.0 * 1024.0)) / seconds,
         });
     }
 }
 
 fn request(
     io: Io,
-    rps: *std.atomic.Value(u64),
-    bytes: *std.atomic.Value(u64),
+    reqs_atomic: *std.atomic.Value(u64),
+    bytes_atomic: *std.atomic.Value(usize),
+    start: *Io.Event,
     connect_fail: *Io.Event,
 ) Io.Cancelable!void {
-    const server_addr = comptime IpAddress.parseLiteral("127.0.0.1:3000") catch unreachable;
-
-    var write_buf: [1024]u8 = undefined;
-    var read_buf: [1024]u8 = undefined;
-    var flate_buf: [std.compress.flate.max_window_len]u8 = undefined;
-
-    var stream = server_addr.connect(io, .{ .mode = .stream }) catch {
-        connect_fail.set(io);
-        return;
+    const stream = server_addr.connect(io, .{ .mode = .stream }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {
+            connect_fail.set(io);
+            return;
+        },
     };
     defer stream.close(io);
 
-    const err = while (true) {
-        var streamw = stream.writer(io, &write_buf);
-        var streamr = stream.reader(io, &read_buf);
-        var flate: std.compress.flate.Decompress = .init(
-            &streamr.interface,
-            .gzip,
-            &flate_buf,
-        );
+    var write_buf: [1024]u8 = undefined;
+    var read_buf: [1024]u8 = undefined;
+    var decomp_buf: [flate.max_window_len]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var sw = stream.writer(io, &write_buf);
+    const sri = &sr.interface;
+    const swi = &sw.interface;
 
-        streamw.interface.writeAll("README.md\x00") catch break streamw.err.?;
-        streamw.interface.flush() catch break streamw.err.?;
+    try start.wait(io);
+    const err = while (true) {
+        swi.writeAll("README.md\x00") catch break sw.err.?;
+        swi.flush() catch break sw.err.?;
 
         // Check for server error
-        const err_token = streamr.interface.peekArray("ERROR".len) catch
-            if (streamr.err) |err| break err else null;
-        if (err_token) |str| {
-            if (std.mem.eql(u8, str, "ERROR")) {
-                const full_err = streamr.interface.takeDelimiter(0) catch |err|
-                    break streamr.err orelse err;
+        const err_token_opt = sri.peekArray("ERROR".len) catch
+            if (sr.err) |err| break err else null;
+        if (err_token_opt) |err_token| {
+            if (std.mem.eql(u8, err_token, "ERROR")) {
+                const full_err = sr.interface.takeDelimiter(0) catch |err|
+                    break sr.err orelse err;
                 log.err("{s}", .{full_err.?});
                 continue;
             }
         }
 
-        const read_bytes = flate.reader.discardRemaining() catch
-            break flate.err orelse streamr.err.?;
+        var decomp: flate.Decompress = .init(sri, .gzip, &decomp_buf);
 
-        _ = rps.fetchAdd(1, .release);
-        _ = bytes.fetchAdd(@intCast(read_bytes), .release);
+        const read = decomp.reader.discardRemaining() catch
+            break decomp.err orelse sr.err.?;
+
+        _ = reqs_atomic.fetchAdd(1, .monotonic);
+        _ = bytes_atomic.fetchAdd(read, .monotonic);
     };
 
-    if (err == error.Canceled) return error.Canceled;
-    log.err("{t}", .{err});
+    switch (err) {
+        error.Canceled => return error.Canceled,
+        error.ReadFailed => {},
+        else => log.err("Fatal error {t}", .{err}),
+    }
 }
