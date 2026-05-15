@@ -28,7 +28,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "options", .module = options.createModule() },
                 .{ .name = "zio", .module = zio_mod },
             },
-            .link_libc = true,
         }),
     });
     b.installArtifact(exe);
