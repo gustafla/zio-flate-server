@@ -7,7 +7,8 @@ A high-performance, fully asynchronous, compressed file server built on Zig's ne
 * **Compression:** Uses `std.compress.flate` to compress files before sending them over the network.
 * **Graceful Shutdown:** Safely handles `SIGINT` (Ctrl+C).
 * **Safe Cancellation:** Protects file-transfer regions to ensure clients never receive half-written data during a shutdown.
-* **Caching:** Caches compressed files using a `StringHashMap` and `Io.RwLock`. Currently doesn't feature any cache invalidation, the server must be restarted if file data changes.
+* **Caching:** Caches compressed files using a `StringHashMap` and `Io.RwLock`.
+* **Cache Invalidation:** On linux, an inotify-based cache invalidation worker keep the cache fresh for files residing inside the working directory (non-recursive).
 
 ## Requirements
 * **Zig 0.16**.

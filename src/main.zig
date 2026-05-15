@@ -4,6 +4,7 @@ const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 const log = std.log;
 const flate = std.compress.flate;
+const linux = std.os.linux;
 const builtin = @import("builtin");
 
 const options = @import("options");
@@ -52,6 +53,12 @@ pub fn main(init: std.process.Init) !void {
 
     var cache: FileCache = .init(gpa);
     defer cache.deinit(io);
+
+    var invalidator = switch (builtin.os.tag) {
+        .linux => io.async(cacheInvalidatorLinux, .{ io, &cache }),
+        else => log.warn("No file watching supported. Expect stale data."),
+    };
+    defer if (@TypeOf(invalidator) != void) invalidator.cancel(io) catch {};
 
     var group: Io.Group = .init;
     defer group.cancel(io);
@@ -174,9 +181,9 @@ const FileCache = struct {
         defer self.lock.unlock(io);
 
         var iterator = self.map.iterator();
-        while (iterator.next()) |item| {
-            self.gpa.free(item.key_ptr.*);
-            self.gpa.free(item.value_ptr.*);
+        while (iterator.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            self.gpa.free(entry.value_ptr.*);
         }
         self.map.deinit(self.gpa);
     }
@@ -230,4 +237,73 @@ const FileCache = struct {
         try self.map.put(self.gpa, key, data);
         return data;
     }
+
+    pub fn invalidate(self: *FileCache, io: Io, path: []const u8) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+
+        if (self.map.fetchRemove(path)) |entry| {
+            self.gpa.free(entry.key);
+            self.gpa.free(entry.value);
+            log.info("Cache invalidated for: {s}", .{path});
+        }
+    }
 };
+
+fn cacheInvalidatorLinux(io: Io, cache: *FileCache) Io.Cancelable!void {
+    const inotify = linux.inotify_init1(linux.IN.CLOEXEC);
+    switch (linux.errno(inotify)) {
+        .SUCCESS => {},
+        else => {
+            log.err("inotify_init1 failed", .{});
+            return;
+        },
+    }
+    const inotify_fd: linux.fd_t = @intCast(inotify);
+
+    var inotify_file = Io.File{
+        .handle = inotify_fd,
+        .flags = .{ .nonblocking = false },
+    };
+    defer inotify_file.close(io);
+
+    const watch = linux.inotify_add_watch(
+        inotify_fd,
+        ".",
+        linux.IN.MODIFY | linux.IN.MOVED_TO | linux.IN.DELETE,
+    );
+    switch (linux.errno(watch)) {
+        .SUCCESS => {},
+        else => {
+            log.err("inotify_add_watch failed", .{});
+            return;
+        },
+    }
+
+    var buf: [@sizeOf(linux.inotify_event) + Io.Dir.max_path_bytes + 1]u8 = undefined;
+
+    while (true) {
+        const bytes_read = inotify_file.readStreaming(io, &.{&buf}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                log.err("Inotify read failed: {t}", .{err});
+                return;
+            },
+        };
+
+        var i: usize = 0;
+        while (i < bytes_read) {
+            const event: *linux.inotify_event = @ptrCast(@alignCast(&buf[i]));
+
+            if (event.len > 0) {
+                const name_start = i + @sizeOf(linux.inotify_event);
+                const name_ptr: [*:0]const u8 = @ptrCast(&buf[name_start]);
+                const name = std.mem.span(name_ptr);
+                log.debug("inotify event: {s}", .{name});
+                cache.invalidate(io, name);
+            }
+
+            i += @sizeOf(linux.inotify_event) + event.len;
+        }
+    }
+}
