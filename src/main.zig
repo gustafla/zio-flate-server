@@ -55,10 +55,11 @@ pub fn main(init: std.process.Init) !void {
     defer cache.deinit(io);
 
     var invalidator = switch (builtin.os.tag) {
-        .linux => io.async(cacheInvalidatorLinux, .{ io, &cache }),
-        else => log.warn("No file watching supported. Expect stale data."),
+        .linux => io.concurrent(cacheInvalidatorLinux, .{ io, &cache }) catch null,
+        else => null,
     };
-    defer if (@TypeOf(invalidator) != void) invalidator.cancel(io) catch {};
+    if (invalidator == null) log.warn("No file watching supported. Expect stale data.", .{});
+    defer if (invalidator) |*inv| inv.cancel(io) catch {};
 
     var group: Io.Group = .init;
     defer group.cancel(io);
