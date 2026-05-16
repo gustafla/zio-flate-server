@@ -148,18 +148,27 @@ const InvalidatorLinux = struct {
         self.task = try io.concurrent(worker, .{ io, self });
     }
 
+    /// This may only be called when parent cache lock is held.
+    /// Indempotent.
     pub fn deinit(self: *InvalidatorLinux, io: Io) void {
         log.debug("InvalidatorLinux.deinit", .{});
         const cache: *Cache = @fieldParentPtr("invalidator", self);
+
+        if (self.inotify_fd < 0) return;
+
         if (self.task) |*task| task.cancel(io) catch {};
+        self.task = null;
         self.path_map.deinit(cache.gpa);
-        _ = linux.close(self.inotify_fd);
+        // Already closed by worker cancelation
+        self.inotify_fd = -1;
     }
 
-    /// This may only be called when parent cache lock is held
+    /// This may only be called when parent cache lock is held.
     fn addWatch(self: *InvalidatorLinux, path: [:0]const u8) void {
         log.debug("InvalidatorLinux.addWatch", .{});
         const cache: *Cache = @fieldParentPtr("invalidator", self);
+
+        if (self.inotify_fd < 0) return;
 
         const watch = linux.inotify_add_watch(
             self.inotify_fd,
@@ -207,7 +216,7 @@ const InvalidatorLinux = struct {
 
             if (event.wd < 0) continue;
 
-            // This prevents addWatch from being called and protects
+            // This prevents addWatch and deinit from being called and protects
             // path_map from concurrent access
             try cache.takeLock(io);
             defer cache.unlock(io);
