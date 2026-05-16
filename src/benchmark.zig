@@ -7,6 +7,8 @@ const flate = std.compress.flate;
 const zio = @import("zio");
 
 const server_addr = IpAddress.parseLiteral("127.0.0.1:3000") catch unreachable;
+const run_seconds_default = 10;
+const connections_default = 1000;
 
 pub fn main(init: std.process.Init) !void {
     const rt = try zio.Runtime.init(init.gpa, .{});
@@ -21,13 +23,22 @@ pub fn main(init: std.process.Init) !void {
     var group: Io.Group = .init;
     defer group.cancel(io);
 
-    for (0..1000) |_| {
+    var run_seconds: u64 = run_seconds_default;
+    var connections: u64 = connections_default;
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
+    if (args.next()) |arg| connections = try std.fmt.parseInt(u64, arg, 0);
+    if (args.next()) |arg| run_seconds = try std.fmt.parseInt(u64, arg, 0);
+    if (args.skip()) return error.UnhandledArgument;
+
+    for (0..connections) |_| {
         group.async(io, request, .{
             io,
             &reqs_atomic,
             &bytes_atomic,
             &start,
             &failed,
+            run_seconds,
         });
     }
 
@@ -36,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     var result_buf: [1]Result = undefined;
     var select: Io.Select(Result) = .init(io, &result_buf);
     defer _ = select.cancel();
-    select.async(.any, sample, .{ io, &reqs_atomic, &bytes_atomic, 10 });
+    select.async(.any, sample, .{ io, &reqs_atomic, &bytes_atomic, run_seconds });
     select.async(.any, Io.Event.wait, .{ &failed, io });
     _ = try select.await();
 }
@@ -45,11 +56,11 @@ fn sample(
     io: Io,
     reqs_atomic: *std.atomic.Value(u64),
     bytes_atomic: *std.atomic.Value(usize),
-    samples: usize,
+    run_seconds: u64,
 ) Io.Cancelable!void {
     const clock: std.Io.Clock = .awake;
 
-    for (0..samples) |i| {
+    for (0..run_seconds) |i| {
         const ts = clock.now(io);
         try io.sleep(.fromSeconds(1), clock);
         const dur = ts.durationTo(clock.now(io));
@@ -74,6 +85,7 @@ fn request(
     bytes_atomic: *std.atomic.Value(usize),
     start: *Io.Event,
     failed: *Io.Event,
+    run_seconds: u64,
 ) Io.Cancelable!void {
     const stream = server_addr.connect(io, .{ .mode = .stream }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -96,7 +108,15 @@ fn request(
     const swi = &sw.interface;
 
     try start.wait(io);
+    const ts: Io.Timestamp = .now(io, .awake);
     const err = while (true) {
+        // Prevent main task starvation
+        if (failed.isSet() or
+            ts.durationTo(.now(io, .awake)).toSeconds() >= run_seconds)
+        {
+            return;
+        }
+
         swi.writeAll("README.md\x00") catch break sw.err.?;
         swi.flush() catch break sw.err.?;
 
