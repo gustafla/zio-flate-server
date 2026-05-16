@@ -193,7 +193,7 @@ const InvalidatorLinux = struct {
     fn worker(io: Io, self: *InvalidatorLinux) Io.Cancelable!void {
         log.debug("InvalidatorLinux.worker", .{});
         const cache: *Cache = @fieldParentPtr("invalidator", self);
-        const file = Io.File{
+        const file: Io.File = .{
             .handle = self.inotify_fd,
             .flags = .{ .nonblocking = false },
         };
