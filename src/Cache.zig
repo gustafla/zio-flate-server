@@ -128,7 +128,7 @@ const InvalidatorLinux = struct {
 
     pub fn init() @This().Error!InvalidatorLinux {
         log.debug("InvalidatorLinux.init", .{});
-        const inotify = linux.inotify_init1(linux.IN.CLOEXEC | linux.IN.NONBLOCK);
+        const inotify = linux.inotify_init1(linux.IN.CLOEXEC);
         switch (linux.errno(inotify)) {
             .SUCCESS => {},
             else => return error.InotifyInitFailed,
@@ -195,40 +195,41 @@ const InvalidatorLinux = struct {
         const cache: *Cache = @fieldParentPtr("invalidator", self);
         const file = Io.File{
             .handle = self.inotify_fd,
-            .flags = .{ .nonblocking = true },
+            .flags = .{ .nonblocking = false },
         };
         defer file.close(io);
 
-        const buf_size = @sizeOf(linux.inotify_event) + Io.Dir.max_path_bytes;
+        const event_size = @sizeOf(linux.inotify_event);
+        const buf_size = event_size + Io.Dir.max_path_bytes;
         var buffer: [buf_size]u8 = undefined;
-        var fr = file.reader(io, &buffer);
-        const fri = &fr.interface;
 
         const err = while (true) {
-            log.debug("InvalidatorLinux.worker calling takeStruct", .{});
-            const event = fri.takeStruct(
-                linux.inotify_event,
-                .native,
-            ) catch |e| break fr.err orelse e;
-            log.debug("InvalidatorLinux.worker calling discardShort", .{});
-            _ = fri.discardShort(event.len) catch break fr.err.?;
-            log.debug("{any}", .{event});
+            log.debug("InvalidatorLinux.worker calling readStreaming", .{});
+            const read = file.readStreaming(io, &.{&buffer}) catch |e| break e;
 
-            if (event.wd < 0) continue;
+            var i: usize = 0;
+            while (i < read) {
+                const slice = buffer[i..event_size];
+                const event = std.mem.bytesAsValue(linux.inotify_event, slice);
+                i += event_size;
+                log.debug("{any}", .{event});
+                i += event.len;
 
-            // This prevents addWatch and deinit from being called and protects
-            // path_map from concurrent access
-            try cache.takeLock(io);
-            defer cache.unlock(io);
+                if (event.wd < 0) continue;
 
-            const path = self.path_map.fetchRemove(event.wd) orelse continue;
-            const data = cache.data_map.fetchRemove(path.value) orelse continue;
-            const key: [:0]const u8 = @ptrCast(data.key);
+                // This prevents addWatch and deinit from being called and protects
+                // path_map from concurrent access
+                try cache.takeLock(io);
+                defer cache.unlock(io);
 
-            log.info("Cache invalidated for {s}", .{key});
-            cache.gpa.free(key);
-            cache.gpa.free(data.value);
-            _ = linux.inotify_rm_watch(self.inotify_fd, event.wd);
+                const path = self.path_map.fetchRemove(event.wd) orelse continue;
+                const data = cache.data_map.fetchRemove(path.value) orelse continue;
+
+                log.info("Cache invalidated for {s}", .{data.key});
+                cache.gpa.free(@as([:0]const u8, @ptrCast(data.key)));
+                cache.gpa.free(data.value);
+                _ = linux.inotify_rm_watch(self.inotify_fd, event.wd);
+            }
         };
 
         if (err == error.Canceled) return error.Canceled;
